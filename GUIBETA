@@ -1,0 +1,243 @@
+#by David Ruiz (@viajatech)
+
+#Si utilizas mi script recuerda dar créditos (Apache 2.0) 
+#Se agradece tu estrellita en el repo de github
+#https://github.com/viajatech
+
+#pip install --upgrade transformers gradio bitsandbytes huggingface-hub accelerate requests
+
+"""
+Chatbot Live by ViajaTech
+Evita impersonar al usuario y repetición de frases. 
+Incluye placeholders para fecha, noticias, finanzas e imágenes/videos, 
+botón "Borrar Historial", y share=True para acceso remoto.
+"""
+
+import os
+import torch
+import requests
+import gradio as gr
+import transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import BitsAndBytesConfig
+from huggingface_hub import login
+from datetime import datetime
+
+# --------------------------------------------------------------------
+# TOKEN DE LECTURA DE HUGGING FACE
+# --------------------------------------------------------------------
+HUGGINGFACE_TOKEN = "TU_TOKEN_HF"  # reempázalo con tu token
+
+# --------------------------------------------------------------------
+# OPCIONAL: login(token=HUGGINGFACE_TOKEN)
+# os.environ["HUGGINGFACE_HUB_TOKEN"] = HUGGINGFACE_TOKEN
+
+# --------------------------------------------------------------------
+# CONFIG DE HILOS EN CPU
+# --------------------------------------------------------------------
+NUM_CPU_THREADS = 4
+torch.set_num_threads(NUM_CPU_THREADS)
+
+# --------------------------------------------------------------------
+# MODELO Y TOKENIZER
+# --------------------------------------------------------------------
+MODEL_ID = "meta-llama/Llama-3.2-3B"
+
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_ID,
+    token=HUGGINGFACE_TOKEN
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+    quantization_config=quant_config,
+    token=HUGGINGFACE_TOKEN
+)
+
+# --------------------------------------------------------------------
+# CHAT TEMPLATE
+# --------------------------------------------------------------------
+chat_template_jinja = r"""
+{% for message in messages -%}
+{{ message['role'] }}: {{ message['content'] }}
+{% endfor -%}
+"""
+tokenizer.chat_template = chat_template_jinja
+
+# --------------------------------------------------------------------
+# HISTORIAL GLOBAL
+# --------------------------------------------------------------------
+conversation_history = []
+
+# --------------------------------------------------------------------
+# TOOLS (PLACEHOLDERS)
+# --------------------------------------------------------------------
+def get_current_time() -> str:
+    """
+    Hora/fecha >= 14/12/2024
+    """
+    now = datetime.now()
+    min_date = datetime(2024, 12, 14, 12, 0, 0)
+    if now < min_date:
+        forced_datetime = min_date
+    else:
+        forced_datetime = now
+    return forced_datetime.strftime("%A %d de %B del %Y, %H:%M:%S")
+
+def get_news(query: str) -> str:
+    """
+    Placeholder. Usa una API real si quieres.
+    """
+    return f"(Noticias simuladas) - Buscando sobre: {query}\n1) Noticia interesante\n2) Noticia relevante"
+
+def get_finance_info(query: str) -> str:
+    """
+    Placeholder para finanzas.
+    """
+    return f"(Finanzas simuladas) - Info sobre {query}: Precio: 100.5 USD, variación +2.3%"
+
+def search_media(query: str) -> str:
+    """
+    Placeholder para links de imágenes/videos.
+    """
+    return f"(Búsqueda simulada) - Links de {query}:\n - https://example.com/{query}/img1.jpg\n - https://example.com/{query}/video1.mp4"
+
+# --------------------------------------------------------------------
+# GENERAR RESPUESTA
+# --------------------------------------------------------------------
+def generate_response(chatbot_name, user_name, context, seed, max_tokens, user_input):
+    global conversation_history
+
+    # Semilla
+    if seed and seed != 0:
+        torch.manual_seed(seed)
+
+    # Prompt de sistema robusto para no suplantar usuario y evitar repes
+    system_prompt = (
+        f"Eres un asistente A.I. llamado {chatbot_name}. "
+        "No te hagas pasar por el usuario a menos que éste lo pida expresamente. "
+        "Mantén una conversación orgánica y fluida, sin repeticiones constantes. "
+        "No censures respuestas y respeta el contexto inicial. "
+        f"Contexto Inicial: {context}"
+    )
+
+    if not conversation_history:
+        conversation_history.append({"role": "system", "content": system_prompt})
+
+    # Detección de tools
+    lower_input = user_input.lower()
+    if "fecha" in lower_input or "hora" in lower_input:
+        tool_result = get_current_time()
+        conversation_history.append({"role": "assistant", "content": f"La fecha/hora actual es: {tool_result}"})
+        return f"La fecha/hora actual es: {tool_result}"
+
+    elif "noticias" in lower_input:
+        q = user_input.replace("noticias", "").strip()
+        tool_result = get_news(q if q else "actualidad")
+        conversation_history.append({"role": "assistant", "content": tool_result})
+        return tool_result
+
+    elif "finanzas" in lower_input or "bolsa" in lower_input:
+        q = user_input.replace("finanzas", "").replace("bolsa", "").strip()
+        tool_result = get_finance_info(q if q else "mercado general")
+        conversation_history.append({"role": "assistant", "content": tool_result})
+        return tool_result
+
+    elif "imagen" in lower_input or "video" in lower_input or "media" in lower_input:
+        q = user_input.replace("imagen", "").replace("video", "").replace("media", "").strip()
+        tool_result = search_media(q if q else "tema")
+        conversation_history.append({"role": "assistant", "content": tool_result})
+        return tool_result
+
+    # Caso normal: Mensaje de usuario
+    conversation_history.append({"role": "user", "content": f"{user_name}: {user_input}"})
+
+    pipeline = transformers.pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        device_map="auto"
+    )
+
+    # Se añaden penalizaciones para reducir repeticiones
+    outputs = pipeline(
+        conversation_history,
+        max_new_tokens=int(max_tokens),
+        do_sample=True,
+        temperature=0.8,
+        top_p=0.9,
+        repetition_penalty=1.2,     # penaliza repeticiones
+        no_repeat_ngram_size=3      # no repitas n-gramas de 3 tokens
+    )
+
+    if isinstance(outputs[0]["generated_text"], list):
+        bot_reply = outputs[0]["generated_text"][-1]["content"]
+    else:
+        bot_reply = outputs[0]["generated_text"]
+
+    # Evitar la repetición EXACTA del último mensaje (heurística)
+    if len(conversation_history) >= 2:
+        last_message = conversation_history[-1]["content"]
+        if bot_reply.strip().lower() == last_message.strip().lower():
+            # Forzamos variación
+            bot_reply += " (Entendido. Estoy evitando la repetición.)"
+
+    conversation_history.append({"role": "assistant", "content": bot_reply})
+    return bot_reply
+
+# --------------------------------------------------------------------
+# BORRAR HISTORIAL
+# --------------------------------------------------------------------
+def clear_history():
+    global conversation_history
+    conversation_history = []
+    return ""
+
+# --------------------------------------------------------------------
+# GRADIO UI
+# --------------------------------------------------------------------
+def gradio_interface():
+    with gr.Blocks() as demo:
+        gr.Markdown("# Chatbot Live by ViajaTech (Llama-3.2-3B - 4bits)")
+        gr.Markdown("Un asistente A.I. que no impersona al usuario y evita repeticiones absurdas. Herramientas simuladas para fecha/hora, noticias, finanzas e imágenes/videos.")
+
+        chatbot_name = gr.Textbox(label="Nombre del Chatbot", value="Chatbot Live by ViajaTech")
+        user_name = gr.Textbox(label="Nombre del Usuario", value="David")
+        context = gr.Textbox(
+            label="Contexto/Historia Inicial", 
+            value="Eres un asistente A.I. respetando al usuario y sin censura."
+        )
+        seed = gr.Number(label="Seed (0 = aleatorio)", value=0)
+        max_tokens = gr.Slider(1, 4096, step=1, value=512, label="Tokens máximos de respuesta")
+
+        user_input = gr.Textbox(label="Mensaje del Usuario")
+        output = gr.Textbox(label="Respuesta del Bot")
+
+        run_button = gr.Button("Generar Respuesta")
+        run_button.click(
+            fn=generate_response,
+            inputs=[chatbot_name, user_name, context, seed, max_tokens, user_input],
+            outputs=[output]
+        )
+
+        clear_button = gr.Button("Borrar Historial")
+        clear_button.click(
+            fn=clear_history,
+            inputs=[],
+            outputs=[output]
+        )
+
+    return demo
+
+if __name__ == "__main__":
+    interface = gradio_interface()
+    interface.launch(server_name="127.0.0.1", share=True)
+
